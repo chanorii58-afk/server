@@ -82,6 +82,57 @@ local FreshThread    = nil
 local CurrentCountry = nil
 local MyLocData      = nil   -- populated once on startup
 
+-- â”€â”€ FILE PERSISTENCE (for cross-session fresh server hunt) â”€â”€â”€â”€â”€â”€â”€
+-- Delta and most executors support writefile / readfile.
+-- We store all known server IDs in a file before teleporting.
+-- On the NEXT script load we compare the new server's JobId against
+-- that list. If it's NOT in the list â†’ brand new server = you're alone.
+local HUNT_FILE = "geohop_hunt.txt"
+
+local function saveHuntData(serverIdList)
+    local lines = { "HUNTING" }
+    for _, id in ipairs(serverIdList) do
+        table.insert(lines, id)
+    end
+    pcall(writefile, HUNT_FILE, table.concat(lines, "\n"))
+end
+
+-- Returns: idSet (dict of known IDs), isHunting (bool)
+local function loadHuntData()
+    local ok, content = pcall(readfile, HUNT_FILE)
+    if not ok or not content or content == "" then return {}, false end
+    local lines = {}
+    for line in content:gmatch("[^\n]+") do
+        if line ~= "" then table.insert(lines, line) end
+    end
+    if #lines < 2 or lines[1] ~= "HUNTING" then return {}, false end
+    local idSet = {}
+    for i = 2, #lines do idSet[lines[i]] = true end
+    return idSet, true
+end
+
+local function clearHuntData()
+    pcall(writefile, HUNT_FILE, "")
+end
+
+-- Fetch ALL server pages (up to 10 pages = 1000 servers max)
+local function fetchAllServerIds(onProgress)
+    local allIds = {}
+    local cursor = nil
+    local page   = 0
+    repeat
+        local srvs, nextCursor = fetchServers(cursor)
+        for _, s in ipairs(srvs) do
+            table.insert(allIds, s.id)
+        end
+        cursor = nextCursor
+        page   = page + 1
+        if onProgress then onProgress(page, #allIds) end
+        if cursor and cursor ~= "" then task.wait(0.35) end
+    until (cursor == nil or cursor == "") or page >= 10
+    return allIds
+end
+
 -- â”€â”€ HELPERS â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 local function hexC(h)
     h = h:gsub("#","")
@@ -727,7 +778,7 @@ FrTitleLbl.TextXAlignment=Enum.TextXAlignment.Left; FrTitleLbl.ZIndex=13
 local FrDescLbl=Instance.new("TextLabel",PgFr)
 FrDescLbl.Size=UDim2.new(1,-20,0,30); FrDescLbl.Position=UDim2.new(0,10,0,30)
 FrDescLbl.BackgroundTransparency=1
-FrDescLbl.Text="Scans all servers once and joins the first with 0 players. If none are empty, it tells you the lowest available."
+FrDescLbl.Text="Scans all servers. Joins the first with 0 players. If none are empty, offers to FORCE CREATE a fresh server by blocking all known servers and teleporting randomly."
 FrDescLbl.TextColor3=T.TextDim; FrDescLbl.TextSize=9; FrDescLbl.Font=Enum.Font.Gotham
 FrDescLbl.TextWrapped=true; FrDescLbl.TextXAlignment=Enum.TextXAlignment.Left; FrDescLbl.ZIndex=13
 
@@ -782,6 +833,27 @@ FrJoinLeastBtn.Visible=false
 rnd(FrJoinLeastBtn,7); bdr(FrJoinLeastBtn,T.Green,1)
 
 local FrLeastServerId = nil
+
+-- Force Create Fresh Server button (shown when scan finds no empty servers)
+local FrForceBtn=Instance.new("TextButton",PgFr)
+FrForceBtn.Size=UDim2.new(1,-16,0,30); FrForceBtn.Position=UDim2.new(0,8,0,285)
+FrForceBtn.BackgroundColor3=Color3.fromRGB(28,8,48)
+FrForceBtn.Text="Force Create Fresh Server"
+FrForceBtn.TextColor3=T.PurpleL; FrForceBtn.TextSize=10
+FrForceBtn.Font=Enum.Font.GothamBold; FrForceBtn.BorderSizePixel=0; FrForceBtn.ZIndex=13
+FrForceBtn.Visible=false
+rnd(FrForceBtn,7); bdr(FrForceBtn,T.PurpleL,1.5)
+
+-- Small explanation under the force button
+local FrForceDescLbl=Instance.new("TextLabel",PgFr)
+FrForceDescLbl.Size=UDim2.new(1,-20,0,24)
+FrForceDescLbl.Position=UDim2.new(0,10,0,320)
+FrForceDescLbl.BackgroundTransparency=1
+FrForceDescLbl.Text="Blocks every existing server then teleports you randomly. GeoHop checks on next re-run if you landed in a truly new server."
+FrForceDescLbl.TextColor3=Color3.fromRGB(85,65,125); FrForceDescLbl.TextSize=8
+FrForceDescLbl.Font=Enum.Font.Gotham; FrForceDescLbl.TextWrapped=true
+FrForceDescLbl.TextXAlignment=Enum.TextXAlignment.Left; FrForceDescLbl.ZIndex=13
+FrForceDescLbl.Visible=false
 
 -- â”€â”€ COUNTRY BUTTONS â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 local openServerPage   -- forward
@@ -1100,12 +1172,100 @@ FrScanBtn.MouseButton1Click:Connect(function()
                 FrJoinLeastBtn.Text = "Join Least Populated ("..leastPlayers.." players)"
             end
 
+            -- Show Force Create option now that we know all servers are occupied
+            FrForceBtn.Visible = true
+            FrForceDescLbl.Visible = true
+
             IsFreshHopping = false
             FrScanBtn.Text = "Scan Again"
             tw(FrScanBtn, {BackgroundColor3=T.BtnBg}, .2)
             FrStopBtn.Visible = false
         end
     end)
+end)
+
+FrJoinLeastBtn.MouseButton1Click:Connect(function()
+    if FrLeastServerId then
+        FrJoinLeastBtn.Text = "Joining..."
+        doJoin(FrLeastServerId)
+    end
+end)
+
+-- â”€â”€ FORCE CREATE FRESH SERVER â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+-- HOW IT WORKS:
+--   1. Fetches every server ID across all pages (up to 1,000 servers).
+--   2. Saves that full list to geohop_hunt.txt on disk.
+--   3. Calls TeleportService:Teleport(PlaceId) â€” no server ID â€” so
+--      Roblox's own matchmaking picks (or creates) a server for us.
+--   4. When you re-run GeoHop in the new session, it reads the file
+--      and checks: is my current JobId in the blocked list?
+--        YES â†’ landed in a known server, still not fresh â†’ retry button
+--        NO  â†’ brand-new server Roblox just created â†’ FRESH CONFIRMED
+
+local function forceCreateFreshServer()
+    IsFreshHopping   = true
+    FrForceBtn.Visible      = false
+    FrForceDescLbl.Visible  = false
+    FrJoinLeastBtn.Visible  = false
+    FrScanBtn.Text          = "Working..."
+    tw(FrScanBtn, {BackgroundColor3=Color3.fromRGB(28,10,48)}, .2)
+    FrStopBtn.Visible       = true
+
+    FreshThread = task.spawn(function()
+        -- Step 1: Scan ALL pages
+        FrStatusLbl.Text = "Step 1 / 3: Scanning ALL server pages...\nCollecting every server ID.\nDo not close the script."
+        tw(FrPFill, {Size=UDim2.new(0,0,1,0)}, .1)
+
+        local allIds = fetchAllServerIds(function(page, total)
+            FrStatusLbl.Text = ("Step 1 / 3: Scanning page %d...\n%d server IDs collected so far.\nDo not close the script."):format(page, total)
+            tw(FrPFill, {Size=UDim2.new(math.min(page/10, 0.55),0,1,0)}, .25)
+        end)
+
+        if not IsFreshHopping then return end
+
+        if #allIds == 0 then
+            FrStatusLbl.Text = "Could not fetch any server IDs.\nCheck your connection and try again."
+            IsFreshHopping = false
+            FrScanBtn.Text = "Scan Again"
+            tw(FrScanBtn, {BackgroundColor3=T.BtnBg}, .2)
+            FrStopBtn.Visible = false
+            return
+        end
+
+        -- Step 2: Write list to disk
+        FrStatusLbl.Text = ("Step 2 / 3: Blocking %d servers...\nSaving to geohop_hunt.txt"):format(#allIds)
+        tw(FrPFill, {Size=UDim2.new(0.7,0,1,0)}, .3)
+
+        saveHuntData(allIds)
+        task.wait(0.6)
+
+        if not IsFreshHopping then return end
+
+        -- Step 3: Random teleport (no server ID = Roblox picks for us)
+        FrStatusLbl.Text = ("Step 3 / 3: Teleporting randomly...\n%d servers are blocked.\nRe-run GeoHop after loading to confirm\nyou are in a truly fresh server."):format(#allIds)
+        tw(FrPFill, {Size=UDim2.new(1,0,1,0)}, .2)
+        task.wait(1.5)
+
+        if not IsFreshHopping then return end
+
+        IsFreshHopping = false
+
+        -- Primary method: Teleport with no server ID
+        local tpOk = pcall(TeleportService.Teleport, TeleportService, PlaceId, LP)
+
+        -- Fallback: try TeleportAsync with blank options if primary fails
+        if not tpOk then
+            task.wait(1)
+            pcall(function()
+                local opts = Instance.new("TeleportOptions")
+                TeleportService:TeleportAsync(PlaceId, {LP}, opts)
+            end)
+        end
+    end)
+end
+
+FrForceBtn.MouseButton1Click:Connect(function()
+    forceCreateFreshServer()
 end)
 
 FrStopBtn.MouseButton1Click:Connect(function()
@@ -1116,13 +1276,6 @@ FrStopBtn.MouseButton1Click:Connect(function()
     FrStopBtn.Visible = false
     FrStatusLbl.Text = "Status: Scan stopped.\nScanned: 0 servers\nEmpty found: 0"
     tw(FrPFill, {Size=UDim2.new(0,0,1,0)}, .2)
-end)
-
-FrJoinLeastBtn.MouseButton1Click:Connect(function()
-    if FrLeastServerId then
-        FrJoinLeastBtn.Text = "Joining..."
-        doJoin(FrLeastServerId)
-    end
 end)
 
 -- â”€â”€ NAVIGATION â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -1204,6 +1357,114 @@ task.spawn(function()
     end
 end)
 
+-- â”€â”€ STARTUP HUNT CHECK â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+-- Runs every time GeoHop loads.
+-- If geohop_hunt.txt exists from a previous Force Create session,
+-- we compare this session's game.JobId against the saved blocked list.
+--   â€¢ JobId NOT in list â†’ Roblox gave us a brand-new server â†’ FRESH!
+--   â€¢ JobId IS  in list â†’ landed in a known server â†’ offer retry
+
+task.spawn(function()
+    local prevIds, wasHunting = loadHuntData()
+    if not wasHunting then return end
+
+    local curJobId = game.JobId
+    if not curJobId or curJobId == "" then return end
+
+    task.wait(1.2) -- Let GUI finish opening first
+
+    -- Sliding banner factory
+    local function showBanner(bgCol, borderCol, titleTxt, titleCol, subTxt, btnLabel)
+        local h = btnLabel and 98 or 72
+        local notif = Instance.new("Frame", SG)
+        notif.Size             = UDim2.new(0,270,0,h)
+        notif.AnchorPoint      = Vector2.new(.5,0)
+        notif.Position         = UDim2.new(.5,0,0,-h-10)
+        notif.BackgroundColor3 = bgCol
+        notif.BorderSizePixel  = 0
+        notif.ZIndex           = 300
+        rnd(notif, 10)
+        bdr(notif, borderCol, 2)
+
+        local t1 = Instance.new("TextLabel", notif)
+        t1.Size = UDim2.new(1,-14,0,22); t1.Position = UDim2.new(0,7,0,7)
+        t1.BackgroundTransparency=1; t1.Text=titleTxt
+        t1.TextColor3=titleCol; t1.TextSize=12
+        t1.Font=Enum.Font.GothamBold; t1.ZIndex=301
+
+        local t2 = Instance.new("TextLabel", notif)
+        t2.Size = UDim2.new(1,-14,0,30); t2.Position = UDim2.new(0,7,0,30)
+        t2.BackgroundTransparency=1; t2.Text=subTxt
+        t2.TextColor3=T.TextDim; t2.TextSize=9
+        t2.Font=Enum.Font.Gotham; t2.TextWrapped=true; t2.ZIndex=301
+
+        local actionBtn = nil
+        if btnLabel then
+            actionBtn = Instance.new("TextButton", notif)
+            actionBtn.Size             = UDim2.new(1,-14,0,26)
+            actionBtn.Position         = UDim2.new(0,7,1,-32)
+            actionBtn.BackgroundColor3 = T.BtnBg
+            actionBtn.Text             = btnLabel
+            actionBtn.TextColor3       = Color3.fromRGB(255,255,255)
+            actionBtn.TextSize         = 10
+            actionBtn.Font             = Enum.Font.GothamBold
+            actionBtn.BorderSizePixel  = 0
+            actionBtn.ZIndex           = 302
+            rnd(actionBtn, 7)
+            bdr(actionBtn, T.BtnBord, 1.5)
+        end
+
+        -- Slide in
+        tw(notif, {Position=UDim2.new(.5,0,0,14)}, .4, Enum.EasingStyle.Back)
+        -- Auto-dismiss
+        local dismissDelay = btnLabel and 18 or 8
+        task.delay(dismissDelay, function()
+            tw(notif, {Position=UDim2.new(.5,0,0,-h-10)}, .28)
+            task.delay(.32, function()
+                if notif.Parent then notif:Destroy() end
+            end)
+        end)
+
+        return notif, actionBtn
+    end
+
+    if not prevIds[curJobId] then
+        -- âœ” Brand-new server â€” not in the blocked list
+        clearHuntData()
+        showBanner(
+            Color3.fromRGB(4,30,6), T.Green,
+            "FRESH SERVER CONFIRMED", T.Green,
+            "This server was NOT in the blocked list.\nRoblox created a new instance. You are alone here.",
+            nil
+        )
+
+    else
+        -- âœ˜ Landed in a known (blocked) server â€” still not fresh
+        local _, retryBtn = showBanner(
+            Color3.fromRGB(30,5,5), T.Red,
+            "Not Fresh - Known Server", T.Red,
+            "You landed in a server that was already blocked.\nTap Retry to teleport again (hunt file kept).",
+            "Retry Teleport"
+        )
+
+        if retryBtn then
+            retryBtn.MouseButton1Click:Connect(function()
+                retryBtn.Text = "Teleporting..."
+                task.delay(0.5, function()
+                    -- hunt file still intact â€” next load will re-check
+                    local ok = pcall(TeleportService.Teleport, TeleportService, PlaceId, LP)
+                    if not ok then
+                        pcall(function()
+                            local opts = Instance.new("TeleportOptions")
+                            TeleportService:TeleportAsync(PlaceId, {LP}, opts)
+                        end)
+                    end
+                end)
+            end)
+        end
+    end
+end)
+
 -- â”€â”€ STARTUP â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 setTab("regions")
 refreshFavorites()
@@ -1234,4 +1495,4 @@ task.spawn(function()
     end
 end)
 
-print("[GeoHop v2] Loaded by Kii")
+print("[GeoHop v2.1] Loaded by Kii | Force Fresh Server enabled")
