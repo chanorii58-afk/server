@@ -855,6 +855,28 @@ FrForceDescLbl.Font=Enum.Font.Gotham; FrForceDescLbl.TextWrapped=true
 FrForceDescLbl.TextXAlignment=Enum.TextXAlignment.Left; FrForceDescLbl.ZIndex=13
 FrForceDescLbl.Visible=false
 
+-- â”€â”€ RECENTLY CREATED SERVER button (always visible on Fresh tab) â”€â”€
+-- Uses sortOrder=Desc so newer servers appear first in the API response.
+-- Then filters for servers with very few players (1-5) which indicates
+-- the server was just created and hasn't filled up yet.
+local FrRecentBtn=Instance.new("TextButton",PgFr)
+FrRecentBtn.Size=UDim2.new(1,-16,0,28)
+FrRecentBtn.Position=UDim2.new(0,8,0,218)
+FrRecentBtn.BackgroundColor3=Color3.fromRGB(6,22,38)
+FrRecentBtn.Text="Join Recently Created Server"
+FrRecentBtn.TextColor3=T.BlueL; FrRecentBtn.TextSize=10
+FrRecentBtn.Font=Enum.Font.GothamBold; FrRecentBtn.BorderSizePixel=0; FrRecentBtn.ZIndex=13
+rnd(FrRecentBtn,7); bdr(FrRecentBtn,T.Blue,1.5)
+
+local FrRecentDescLbl=Instance.new("TextLabel",PgFr)
+FrRecentDescLbl.Size=UDim2.new(1,-20,0,14)
+FrRecentDescLbl.Position=UDim2.new(0,10,0,250)
+FrRecentDescLbl.BackgroundTransparency=1
+FrRecentDescLbl.Text="Finds servers with 1-5 players â€” freshly created and barely populated."
+FrRecentDescLbl.TextColor3=Color3.fromRGB(60,80,120); FrRecentDescLbl.TextSize=8
+FrRecentDescLbl.Font=Enum.Font.Gotham; FrRecentDescLbl.TextWrapped=true
+FrRecentDescLbl.TextXAlignment=Enum.TextXAlignment.Left; FrRecentDescLbl.ZIndex=13
+
 -- â”€â”€ COUNTRY BUTTONS â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 local openServerPage   -- forward
 local refreshFavorites -- forward
@@ -1247,13 +1269,39 @@ local function forceCreateFreshServer()
         task.wait(1.5)
 
         if not IsFreshHopping then return end
-
         IsFreshHopping = false
 
-        -- Primary method: Teleport with no server ID
-        local tpOk = pcall(TeleportService.Teleport, TeleportService, PlaceId, LP)
+        -- â”€â”€ METHOD A: ReserveServer â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        -- Creates a brand-new PRIVATE server instance for this place.
+        -- If it works this is 100% guaranteed to be a fresh empty server.
+        FrStatusLbl.Text = ("Step 3 / 3: Creating fresh server...\n%d servers blocked.\nTrying private server method (guaranteed fresh)..."):format(#allIds)
+        task.wait(0.6)
 
-        -- Fallback: try TeleportAsync with blank options if primary fails
+        local reserveOk, accessCode = pcall(function()
+            return TeleportService:ReserveServer(PlaceId)
+        end)
+
+        if reserveOk and type(accessCode) == "string" and #accessCode > 10 then
+            -- Got a reserved server code â€” this is truly empty
+            FrStatusLbl.Text = "Private server created!\nTeleporting to guaranteed fresh instance...\nYou will be completely alone."
+            task.wait(0.8)
+            local joinOk = pcall(function()
+                TeleportService:TeleportToPrivateServer(PlaceId, accessCode, {LP})
+            end)
+            if joinOk then
+                -- Teleport fired â€” clear hunt file since we KNOW it's fresh
+                clearHuntData()
+                task.wait(4)
+            end
+        end
+
+        -- â”€â”€ METHOD B: Random Teleport (fallback) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        -- ReserveServer is server-side in most games so it may fail.
+        -- Random teleport is the fallback; hunt file confirms on next load.
+        FrStatusLbl.Text = ("Private server unavailable for this game.\nFalling back: random teleport...\n%d servers blocked.\nRe-run GeoHop on next load to confirm."):format(#allIds)
+        task.wait(1.2)
+
+        local tpOk = pcall(TeleportService.Teleport, TeleportService, PlaceId, LP)
         if not tpOk then
             task.wait(1)
             pcall(function()
@@ -1266,6 +1314,93 @@ end
 
 FrForceBtn.MouseButton1Click:Connect(function()
     forceCreateFreshServer()
+end)
+
+-- â”€â”€ RECENTLY CREATED SERVER LOGIC â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+-- Steps:
+--  1. Fetch up to 100 servers with sortOrder=Desc (newest-listed first).
+--  2. Filter for playing count 1-5 (server just spun up, barely populated).
+--  3. Sort filtered results by playing ascending (fewest = freshest feel).
+--  4. Join the top result.
+--  5. If none in the 1-5 range, fall back to the overall least-populated.
+FrRecentBtn.MouseButton1Click:Connect(function()
+    if IsFreshHopping then return end
+
+    FrRecentBtn.Text = "Searching..."
+    tw(FrRecentBtn, {BackgroundColor3=Color3.fromRGB(6,32,52)}, .15)
+
+    task.spawn(function()
+        -- Fetch with Desc order â€” Roblox tends to list newer servers later,
+        -- so Desc may surface the most recently created instances first.
+        local url = ("https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=Desc&excludeFullGames=false&limit=100"):format(PlaceId)
+        local ok, raw = pcall(game.HttpGet, game, url)
+
+        if not ok or not raw then
+            FrRecentBtn.Text = "Request failed â€” try again"
+            tw(FrRecentBtn, {BackgroundColor3=Color3.fromRGB(6,22,38)}, .15)
+            task.delay(3, function()
+                if FrRecentBtn.Parent then FrRecentBtn.Text="Join Recently Created Server" end
+            end)
+            return
+        end
+
+        local ok2, data = pcall(HttpService.JSONDecode, HttpService, raw)
+        if not ok2 or not data or not data.data then
+            FrRecentBtn.Text = "No data returned"
+            tw(FrRecentBtn, {BackgroundColor3=Color3.fromRGB(6,22,38)}, .15)
+            task.delay(3, function()
+                if FrRecentBtn.Parent then FrRecentBtn.Text="Join Recently Created Server" end
+            end)
+            return
+        end
+
+        local srvs = data.data
+        if #srvs == 0 then
+            FrRecentBtn.Text = "No servers found"
+            tw(FrRecentBtn, {BackgroundColor3=Color3.fromRGB(6,22,38)}, .15)
+            task.delay(3, function()
+                if FrRecentBtn.Parent then FrRecentBtn.Text="Join Recently Created Server" end
+            end)
+            return
+        end
+
+        -- Filter: 1-5 players = recently created and barely populated
+        local fresh = {}
+        for _, s in ipairs(srvs) do
+            if s.playing >= 1 and s.playing <= 5 then
+                table.insert(fresh, s)
+            end
+        end
+
+        -- Sort by fewest players first (closest to brand-new)
+        table.sort(fresh, function(a,b) return a.playing < b.playing end)
+
+        local target = nil
+        local label  = ""
+
+        if #fresh > 0 then
+            target = fresh[1]
+            label  = ("Found %d recent server(s). Joining one with %d player(s)..."):format(#fresh, target.playing)
+        else
+            -- No 1-5 player servers found â€” fall back to least-populated
+            table.sort(srvs, function(a,b) return a.playing < b.playing end)
+            target = srvs[1]
+            label  = ("No 1-5 player servers found.\nJoining least populated: %d/%d players..."):format(target.playing, target.maxPlayers)
+        end
+
+        FrRecentBtn.Text = label ~= "" and "Joining..." or "Joining..."
+        FrStatusLbl.Text = "Status: " .. label
+
+        task.wait(0.5)
+        doJoin(target.id)
+
+        task.delay(5, function()
+            if FrRecentBtn.Parent then
+                FrRecentBtn.Text = "Join Recently Created Server"
+                tw(FrRecentBtn, {BackgroundColor3=Color3.fromRGB(6,22,38)}, .15)
+            end
+        end)
+    end)
 end)
 
 FrStopBtn.MouseButton1Click:Connect(function()
